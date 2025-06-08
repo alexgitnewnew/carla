@@ -85,6 +85,7 @@ class CarlaEnvDDPG(gym.Env):
         self.obstacle_side = None
         self.pole_detected = False
         self.front_obstacle = False
+        self.latest_lidar_points = None
         self.safety_distance = 4.0
 
         self.fixed_spawn_point = carla.Transform(
@@ -169,6 +170,7 @@ class CarlaEnvDDPG(gym.Env):
         self.obstacle_side = None
         self.pole_detected = False
         self.front_obstacle = False
+        self.latest_lidar_points = None
 
         # Инициализация окна для семантической камеры
         cv2.namedWindow('Semantic Camera', cv2.WINDOW_AUTOSIZE)
@@ -216,6 +218,7 @@ class CarlaEnvDDPG(gym.Env):
 
     def process_lidar(self, data):
         points = np.frombuffer(data.raw_data, dtype=np.float32).reshape(-1, 4)
+        self.latest_lidar_points = points
         distances = np.linalg.norm(points[:, :3], axis=1)
 
         # Проверка препятствий на безопасной дистанции
@@ -443,14 +446,10 @@ class CarlaEnvDDPG(gym.Env):
 
         # Награда за объезд препятствий
         if self.obstacle_side is not None:
-            points = np.frombuffer(self.lidar.get().raw_data, dtype=np.float32).reshape(-1, 4)
-            distances = np.linalg.norm(points[:, :3], axis=1)
-            close_obstacles = (distances >= 0.2) & (distances <= 0.3) & (points[:, 0] > 0)
-            if not np.any(close_obstacles):
+            if not self.front_obstacle:
                 reward += OBSTACLE_AVOIDANCE_BONUS
                 print("[REWARD] Успешный объезд препятствия (LiDAR)! Бонус +50.")
                 self.obstacle_side = None
-                self.front_obstacle = False
             else:
                 reward += OBSTACLE_PENALTY
                 print("[REWARD] Препятствие не объезжено! Штраф -100.")

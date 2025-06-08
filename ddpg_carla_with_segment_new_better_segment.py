@@ -84,6 +84,9 @@ class CarlaEnvDDPG(gym.Env):
         self.step_counter = 0
         self.obstacle_side = None
         self.pole_detected = False
+        self.front_obstacle = False
+        self.latest_lidar_points = None
+        self.safety_distance = 4.0
 
         self.fixed_spawn_point = carla.Transform(
             carla.Location(x=80.265495, y=16.907003, z=0.600000),
@@ -166,6 +169,8 @@ class CarlaEnvDDPG(gym.Env):
         self.step_counter = 0
         self.obstacle_side = None
         self.pole_detected = False
+        self.front_obstacle = False
+        self.latest_lidar_points = None
 
         # Инициализация окна для семантической камеры
         cv2.namedWindow('Semantic Camera', cv2.WINDOW_AUTOSIZE)
@@ -213,28 +218,43 @@ class CarlaEnvDDPG(gym.Env):
 
     def process_lidar(self, data):
         points = np.frombuffer(data.raw_data, dtype=np.float32).reshape(-1, 4)
+        self.latest_lidar_points = points
         distances = np.linalg.norm(points[:, :3], axis=1)
-        # Фильтр для препятствий на расстоянии 20–30 см
-        close_obstacles = (distances >= 0.2) & (distances <= 0.3) & (points[:, 0] > 0) & (points[:, 2] > 0.5)
+
+        # Проверка препятствий на безопасной дистанции
+        front_mask = (
+            (points[:, 0] > 0)
+            & (points[:, 0] <= self.safety_distance)
+            & (np.abs(points[:, 1]) < 1.5)
+            & (points[:, 2] > 0.3)
+        )
+        self.front_obstacle = np.any(front_mask)
+
+        # Фильтр для очень близких препятствий (20-30 см)
+        close_obstacles = (
+            (distances >= 0.2)
+            & (distances <= 0.3)
+            & (points[:, 0] > 0)
+            & (points[:, 2] > 0.5)
+        )
         if np.any(close_obstacles):
             self.episode_reward -= 100
             print("[LiDAR] Препятствие на расстоянии 20–30 см! Штраф -100.")
 
         self.obstacle_side = None
         self.pole_detected = False
-        if np.any(close_obstacles):
-            obstacle_points = points[close_obstacles]
-            mean_y = np.mean(obstacle_points[:, 1])
+        check_points = points[front_mask | close_obstacles]
+        if check_points.size > 0:
+            mean_y = np.mean(check_points[:, 1])
             if mean_y > 0.1:
                 self.obstacle_side = 'right'
                 print("[LiDAR] Препятствие справа, планируем объезд налево.")
             elif mean_y < -0.1:
                 self.obstacle_side = 'left'
                 print("[LiDAR] Препятствие слева, планируем объезд направо.")
-            # Проверка на столбы
-            if np.any(obstacle_points[:, 2] > 1.0):
+            if np.any(check_points[:, 2] > 1.0):
                 self.pole_detected = True
-                print("[LiDAR] Обнаружен столб на расстоянии 20–30 см!")
+                print("[LiDAR] Обнаружен столб!")
 
     def analyze_semantic_image(self):
         if self.sem_image is None:
@@ -256,6 +276,11 @@ class CarlaEnvDDPG(gym.Env):
         steer_adjustment = 0
         reward_adjustment = 0
         lane_center_deviation = 0
+
+        lane_diff = analysis['right']['lane_marking'] - analysis['left']['lane_marking']
+        if abs(lane_diff) > 0.01:
+            steer_adjustment -= lane_diff * 2.0
+            lane_center_deviation += abs(lane_diff)
 
         # Проверка разметки
         if analysis['center']['lane_marking'] > 0.05:
@@ -348,6 +373,10 @@ class CarlaEnvDDPG(gym.Env):
         throttle = np.clip(action[0], 0.2, 1.0)
         steer = np.clip(action[1], -1.0, 1.0)
 
+        if self.front_obstacle:
+            throttle = min(throttle, 0.3)
+            print("[SAFE] Замедляемся: препятствие впереди.")
+
         # Получение следующей точки маршрута
         waypoint = self.get_next_waypoint()
         target_vector = np.array([
@@ -417,10 +446,7 @@ class CarlaEnvDDPG(gym.Env):
 
         # Награда за объезд препятствий
         if self.obstacle_side is not None:
-            points = np.frombuffer(self.lidar.get().raw_data, dtype=np.float32).reshape(-1, 4)
-            distances = np.linalg.norm(points[:, :3], axis=1)
-            close_obstacles = (distances >= 0.2) & (distances <= 0.3) & (points[:, 0] > 0)
-            if not np.any(close_obstacles):
+            if not self.front_obstacle:
                 reward += OBSTACLE_AVOIDANCE_BONUS
                 print("[REWARD] Успешный объезд препятствия (LiDAR)! Бонус +50.")
                 self.obstacle_side = None
@@ -462,6 +488,7 @@ class CarlaEnvDDPG(gym.Env):
         print(f"🚗 Отклонение от траектории: {distance_deviation:.2f} | Общее расстояние: {self.distance:.2f}")
         print(f"🎯 Обнаружено препятствие? {'Да' if self.obstacle_side is not None else 'Нет'}")
         print(f"🎯 Обнаружен столб? {'Да' if self.pole_detected else 'Нет'}")
+        print(f"⚠️ Препятствие впереди? {'Да' if self.front_obstacle else 'Нет'}")
         print(f"📊 Текущая награда: {reward:.2f} | Общая награда: {self.episode_reward:.2f}")
 
         return self.state, reward, done, {}
